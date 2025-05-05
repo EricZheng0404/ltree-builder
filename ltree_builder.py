@@ -95,7 +95,7 @@ class LTreemerger:
                 edge_label = ""
                 if self.stats[child_path].latencies:
                     edge_label = (
-                        f" [label=\"p50={self.stats[child_path].p50:.1f}ms\\n"
+                        f" [label=\"p50={self.stats[child_path].p50:.1f}ms, "
                         f"n={len(self.stats[child_path].latencies)}\"]"
                     )
                 out_lines.append(f"\"{'.'.join(map(str,path)) or 'root'}\" -> "
