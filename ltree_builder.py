@@ -8,14 +8,19 @@ from pathlib import Path
 ###############################################################################
 # 1. Utilities
 ###############################################################################
+# NodeStat: stores request latencies and intervals
 @dataclass
 class NodeStat:
     latencies: list = field(default_factory=list)
+    intervals: list = field(default_factory=list)   # (start, end) for child‑vs‑child overlap
+    count: int = 0
 
-    def update(self, rt):
-        # rt in CASPER is request time in ms (can be -1 for async or errors)
+    def update(self, rt, bt=None):
+        self.count += 1
         if rt >= 0:
             self.latencies.append(rt)
+            if bt is not None:
+                self.intervals.append((bt, bt + rt))
 
     @property
     def p50(self):
@@ -33,6 +38,7 @@ class NodeStat:
 ###############################################################################
 # 2. Per-trace tree (a thin wrapper around nested dicts)
 ###############################################################################
+# TraceTree: builds a tree for a single trace using rpcid hierarchy (0.1.1.2 …).
 class TraceTree:
     """Builds a tree for a single trace using rpcid hierarchy (0.1.1.2 …)."""
 
@@ -41,29 +47,63 @@ class TraceTree:
         self.stats = defaultdict(NodeStat)
         self._build(df_trace)
 
-    def _insert(self, path, rt):
+    def _insert(self, path, rt, bt):
         node = self.root
         for hop in path:
             node = node.setdefault(hop, {})
-        self.stats[tuple(path)].update(rt)
+        self.stats[tuple(path)].update(rt, bt)
+        # record child intervals *only* when start time is available
+        if bt is not None and len(path) > 1:
+            parent = tuple(path[:-1])
+            self._child_intervals[parent].append((bt, bt + rt))
 
     def _build(self, df_trace):
-        # rpcid "0.1.2" → hops = [0,1,2]
+        self._child_intervals = defaultdict(list)
+        # decide which column stores the RPC start time
+        candidate_cols = ["bt", "timestamp", "cs", "startTime", "start", "ts"]
+        start_col = next((c for c in candidate_cols if c in df_trace.columns), None)
+
         for _, row in df_trace.sort_values("rpcid").iterrows():
-            rpcid = row["rpcid"]
-            if all(part.isdigit() for part in rpcid.split(".")):
-                hops = [int(h) for h in row["rpcid"].split(".")]
-                self._insert(hops, row["rt"])
+            raw_parts = str(row["rpcid"]).split(".")
+            hops = []
+            malformed = False
+            for part in raw_parts:
+                # handle weird tokens like '13‑84f9f…' → keep prefix before '-'
+                num_token = part.split("-")[0]
+                try:
+                    hops.append(int(num_token))
+                except ValueError:
+                    malformed = True
+                    break         # abandon this row; rpcid not integer‑hierarchy
+            if malformed:
+                continue           # skip bad rpcid rows silently
+            bt_val = row.get(start_col) if start_col else None
+            self._insert(hops, row["rt"], bt_val)
+
+        # after we’ve seen all children we can decide parallel vs sequential
+        self.parallel = {}
+        for parent, ivals in self._child_intervals.items():
+            if len(ivals) <= 1:
+                self.parallel[parent] = False
+                continue
+            ivals.sort(key=lambda x: x[0])
+            overlap = any(s < prev_end for (s, e), (_, prev_end)
+                          in zip(ivals[1:], ivals))
+            self.parallel[parent] = overlap
 
 ###############################################################################
 # 3. L-tree merger
 ###############################################################################
+# LTreemerger: merges many TraceTree objects into one aggregated L-tree.
 class LTreemerger:
     """Merge many TraceTree objects into one aggregated L-tree."""
 
     def __init__(self):
         self.root = {}
         self.stats = defaultdict(NodeStat)
+        # votes: how many traces said "children under P overlap?"
+        self._par_votes: defaultdict[tuple, int] = defaultdict(int)
+        self._par_total: defaultdict[tuple, int] = defaultdict(int)
 
     def _merge_dict(self, src, dst_path):
         for key, child in src.items():
@@ -80,11 +120,30 @@ class LTreemerger:
         return node
 
     def add_trace(self, trace_tree: TraceTree):
-        # merge topology
+        # 1 · merge topology
         self._merge_dict(trace_tree.root, tuple())
-        # merge latency stats
+
+        # 2 · merge latency stats
         for path, stat in trace_tree.stats.items():
             self.stats[path].latencies.extend(stat.latencies)
+            self.stats[path].count += stat.count
+
+        # 3 · merge “is‑parallel?” votes
+        for parent_path, is_par in trace_tree.parallel.items():
+            self._par_votes[parent_path] += int(is_par)
+            self._par_total[parent_path] += 1
+    # ------------------------------------------------------------------
+    def is_parallel(self, parent_path: tuple, threshold: float = 0.5) -> bool:
+        """
+        Return True if children under `parent_path` are considered parallel.
+
+        We classify as parallel when ≥ `threshold` fraction of traces that
+        contain `parent_path` had overlapping child intervals.
+        """
+        total = self._par_total.get(parent_path, 0)
+        if total == 0:
+            return False
+        return self._par_votes[parent_path] / total >= threshold
 
     ############### convenience output ###############
     def to_dot(self, outfile="ltree.dot"):
@@ -111,6 +170,7 @@ class LTreemerger:
 ###############################################################################
 # 4. Driver code: load CASPER CSVs → build L-tree
 ###############################################################################
+# build_ltree: load CASPER CSVs → build L-tree
 def build_ltree(casper_dir, limit=None):
     merger = LTreemerger()
     csv_files = sorted(Path(casper_dir).glob("*.csv"))
