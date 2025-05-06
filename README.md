@@ -1,5 +1,7 @@
 ###############################################################
-CS151 Spring: Recreate L-tree in LatenSeer Paper
+2025 Spring
+CS151 Debugging Cloud Computing Project:
+Recreate L-tree in LatenSeer Paper
 ###############################################################
 
 ###############################################################
